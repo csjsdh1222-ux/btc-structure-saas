@@ -67,6 +67,8 @@ class DetectorConfig:
     volume_ratio_threshold: float
     score_threshold: float
     swing_high_tolerance: float
+    chasing_rise_15m_threshold: float
+    volume_drop_threshold_ratio: float
 
 
 REAL_CONFIG = DetectorConfig(
@@ -75,6 +77,8 @@ REAL_CONFIG = DetectorConfig(
     volume_ratio_threshold=2.0,
     score_threshold=0.7,
     swing_high_tolerance=0.003,
+    chasing_rise_15m_threshold=0.08,
+    volume_drop_threshold_ratio=0.5,
 )
 
 TEST_CONFIG = DetectorConfig(
@@ -83,6 +87,8 @@ TEST_CONFIG = DetectorConfig(
     volume_ratio_threshold=1.3,
     score_threshold=0.5,
     swing_high_tolerance=0.007,
+    chasing_rise_15m_threshold=0.12,
+    volume_drop_threshold_ratio=0.3,
 )
 
 
@@ -229,42 +235,44 @@ def evaluate_btc_condition() -> str:
     return "bullish" if move > 0 else "bearish"
 
 
-def is_chasing_risk(candles: Sequence[Candle]) -> bool:
+def assess_chasing_risk(candles: Sequence[Candle], rise_threshold: float) -> Tuple[bool, float]:
     if len(candles) < 4:
-        return True
+        return True, 0.0
 
-    # 15분 상승률 8% 이상.
+    # 최근 15분 상승률.
     prior = candles[-4].close
     rise_15m = (candles[-1].close - prior) / prior if prior > 0 else 0.0
-    if rise_15m >= 0.08:
-        return True
+    if rise_15m >= rise_threshold:
+        return True, rise_15m
 
     # 최근 3개 양봉 + 거래량 감소.
     last3 = candles[-3:]
     all_green = all(c.close > c.open for c in last3)
     vol_desc = last3[0].volume > last3[1].volume > last3[2].volume
     if all_green and vol_desc:
-        return True
+        return True, rise_15m
 
     # 긴 윗꼬리: wick >= 2 * body.
     c = candles[-1]
     body = abs(c.close - c.open)
     upper_wick = c.high - max(c.open, c.close)
     if body > 0 and upper_wick >= 2 * body:
-        return True
+        return True, rise_15m
 
-    return False
+    return False, rise_15m
 
 
-def is_volume_drop_risk(one_min_candles: Sequence[Candle]) -> bool:
+def assess_volume_drop_risk(
+    one_min_candles: Sequence[Candle], threshold_ratio: float
+) -> Tuple[bool, float, float]:
     if len(one_min_candles) < 7:
-        return False
+        return False, 0.0, 0.0
 
     current = one_min_candles[-1].volume
     avg_prev5 = sum(c.volume for c in one_min_candles[-6:-1]) / 5
     if avg_prev5 <= 0:
-        return False
-    return current <= 0.5 * avg_prev5
+        return False, current, avg_prev5
+    return current <= threshold_ratio * avg_prev5, current, avg_prev5
 
 
 def calculate_pump_score(
@@ -390,29 +398,39 @@ def scan_symbol(symbol: str, btc_condition: str, config: DetectorConfig) -> Tupl
     price_ok = price_change >= config.price_change_threshold
     volume_ok = volume_ratio >= config.volume_ratio_threshold
 
-    chasing_risk = is_chasing_risk(candles_5m)
-    volume_drop_risk = is_volume_drop_risk(candles_1m)
+    chasing_risk, rise_15m = assess_chasing_risk(candles_5m, config.chasing_rise_15m_threshold)
+    volume_drop_risk, current_1m_volume, avg_prev5_1m_volume = assess_volume_drop_risk(
+        candles_1m, config.volume_drop_threshold_ratio
+    )
 
     # 무효화 조건.
     if btc_condition == "bearish_crash":
         return None, "btc_bearish_crash"
     if not volume_ok and price_ok:
-        return None, "volume_below_threshold"
+        return None, f"volume_below_threshold(ratio={volume_ratio:.2f}x, required={config.volume_ratio_threshold:.2f}x)"
     if chasing_risk:
-        return None, "chasing_risk"
+        return None, (
+            f"chasing_risk(rise_15m={rise_15m * 100:+.2f}%, "
+            f"threshold={config.chasing_rise_15m_threshold * 100:.0f}%+)"
+        )
     if volume_drop_risk:
-        return None, "volume_drop_risk"
+        return None, (
+            "volume_drop_risk("
+            f"current_1m={current_1m_volume:.0f}, "
+            f"avg_prev5={avg_prev5_1m_volume:.0f}, "
+            f"threshold={config.volume_drop_threshold_ratio:.2f}"
+            ")"
+        )
 
     # 필수 조건: 가격+거래량+swing
     if not (price_ok and volume_ok and swing_ok):
-        failed: List[str] = []
-        if not price_ok:
-            failed.append("price")
-        if not volume_ok:
-            failed.append("volume")
-        if not swing_ok:
-            failed.append("swing")
-        return None, f"required_conditions_not_met({','.join(failed)})"
+        return None, (
+            "required_conditions_not_met("
+            f"price={price_ok} change={price_change * 100:+.2f}%, "
+            f"volume={volume_ok} ratio={volume_ratio:.2f}x, "
+            f"swing={swing_ok}"
+            ")"
+        )
 
     score = calculate_pump_score(price_ok, volume_ok, swing_ok, fvg_ok, rebound_ok, btc_condition)
     reasons = _build_reasons(price_ok, volume_ok, swing_ok, fvg_ok, rebound_ok)
@@ -478,6 +496,7 @@ def main() -> None:
     print(f"[INFO] scanning {len(symbols)} symbols | mode={config.mode} | btc_condition={btc_condition}")
 
     alerts = 0
+    filtered_counts: Dict[str, int] = {}
     now_ts = time.time()
     now_iso = datetime.now(timezone.utc).isoformat()
 
@@ -494,6 +513,8 @@ def main() -> None:
             if args.debug:
                 reason = reject_reason or "filtered"
                 print(f"[DEBUG] {symbol} filtered: {reason}")
+            base_reason = (reject_reason or "filtered").split("(", 1)[0]
+            filtered_counts[base_reason] = filtered_counts.get(base_reason, 0) + 1
             continue
 
         if should_alert(
@@ -516,7 +537,10 @@ def main() -> None:
             alerts += 1
 
     elapsed = time.time() - start
-    print(f"[INFO] scan complete | alerts={alerts} | elapsed={elapsed:.1f}s")
+    filtered_text = ", ".join(f"{k}: {v}" for k, v in sorted(filtered_counts.items()))
+    print(
+        f"[INFO] scan complete | alerts={alerts} | filtered={{{filtered_text}}} | elapsed={elapsed:.1f}s"
+    )
 
 
 if __name__ == "__main__":
