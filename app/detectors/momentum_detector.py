@@ -216,13 +216,21 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         help="Ignore normal market filters and alert if score >= 0.3 (test only).",
     )
+    parser.add_argument(
+        "--watch",
+        action="store_true",
+        help="Run repeated scans at a fixed interval until interrupted.",
+    )
+    parser.add_argument(
+        "--interval-seconds",
+        type=int,
+        default=120,
+        help="Interval seconds between scans when --watch is enabled (default: 120).",
+    )
     return parser.parse_args()
 
 
-def main() -> None:
-    args = _parse_args()
-    config = TEST_CONFIG if args.test_mode else REAL_CONFIG
-
+def _run_single_scan(args: argparse.Namespace, config: MomentumConfig) -> None:
     LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
 
     start = time.time()
@@ -298,6 +306,33 @@ def main() -> None:
     print(
         f"[INFO] scan complete | alerts={alerts} | filtered={{{filtered_text}}} | elapsed={elapsed:.1f}s"
     )
+
+
+def main() -> None:
+    args = _parse_args()
+    config = TEST_CONFIG if args.test_mode else REAL_CONFIG
+
+    if args.interval_seconds <= 0:
+        raise SystemExit("--interval-seconds must be a positive integer.")
+
+    if not args.watch:
+        _run_single_scan(args, config)
+        return
+
+    print(
+        f"[INFO] watch mode enabled | interval={args.interval_seconds}s "
+        "(press Ctrl+C to stop safely)"
+    )
+    scan_count = 0
+    try:
+        while True:
+            scan_count += 1
+            print(f"[INFO] watch scan #{scan_count} started")
+            _run_single_scan(args, config)
+            print(f"[INFO] next scan in {args.interval_seconds}s")
+            time.sleep(args.interval_seconds)
+    except KeyboardInterrupt:
+        print("\n[INFO] Ctrl+C received. Exiting watch mode safely.")
 
 
 if __name__ == "__main__":
