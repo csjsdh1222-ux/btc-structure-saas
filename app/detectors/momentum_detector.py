@@ -125,7 +125,12 @@ def write_alert_csv(
         )
 
 
-def scan_symbol(symbol: str, btc_condition: str, config: MomentumConfig) -> Tuple[Optional[PumpMetrics], Optional[str]]:
+def scan_symbol(
+    symbol: str,
+    btc_condition: str,
+    config: MomentumConfig,
+    force_signal: bool = False,
+) -> Tuple[Optional[PumpMetrics], Optional[str]]:
     candles_5m = fetch_klines(symbol, "5m", 40)
     if len(candles_5m) < 25:
         return None, "insufficient_candles"
@@ -146,11 +151,11 @@ def scan_symbol(symbol: str, btc_condition: str, config: MomentumConfig) -> Tupl
 
     chasing_risk, _ = assess_chasing_risk(candles_5m, config.chasing_rise_15m_threshold)
 
-    if btc_condition == "bearish_crash":
+    if btc_condition == "bearish_crash" and not force_signal:
         return None, "btc_bearish_crash"
 
     # 보조 레이더 필수 조건: 15분 모멘텀 + 거래량.
-    if not (price_ok and volume_ok):
+    if not (price_ok and volume_ok) and not force_signal:
         return None, (
             "required_conditions_not_met("
             f"momentum_15m={price_ok} rise={rise_15m * 100:+.2f}%, "
@@ -206,6 +211,11 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         help="Print why each symbol was filtered out.",
     )
+    parser.add_argument(
+        "--force-signal",
+        action="store_true",
+        help="Ignore normal market filters and alert if score >= 0.3 (test only).",
+    )
     return parser.parse_args()
 
 
@@ -217,7 +227,7 @@ def main() -> None:
 
     start = time.time()
     btc_condition = evaluate_btc_condition()
-    if btc_condition == "bearish_crash":
+    if btc_condition == "bearish_crash" and not args.force_signal:
         print("[INFO] BTC 급락 조건 충족으로 이번 스캔 신호를 모두 무효화합니다.")
         return
 
@@ -226,7 +236,10 @@ def main() -> None:
         print("[WARN] 스캔 대상 심볼을 가져오지 못했습니다.")
         return
 
-    print(f"[INFO] scanning {len(symbols)} symbols | mode={config.mode} | btc_condition={btc_condition}")
+    print(
+        f"[INFO] scanning {len(symbols)} symbols | mode={config.mode} "
+        f"| btc_condition={btc_condition} | force_signal={args.force_signal}"
+    )
 
     alerts = 0
     filtered_counts: Dict[str, int] = {}
@@ -237,7 +250,12 @@ def main() -> None:
         if symbol == "BTCUSDT":
             continue
         try:
-            metric, reject_reason = scan_symbol(symbol, btc_condition, config)
+            metric, reject_reason = scan_symbol(
+                symbol,
+                btc_condition,
+                config,
+                force_signal=args.force_signal,
+            )
         except Exception as exc:
             print(f"[WARN] symbol scan failed: {symbol} ({exc})")
             continue
@@ -250,13 +268,19 @@ def main() -> None:
             filtered_counts[base_reason] = filtered_counts.get(base_reason, 0) + 1
             continue
 
-        if should_alert(
-            symbol,
-            metric.current_price,
-            metric.score,
-            now_ts,
-            config.score_threshold,
-        ):
+        alert_ready = (
+            metric.score >= 0.3
+            if args.force_signal
+            else should_alert(
+                symbol,
+                metric.current_price,
+                metric.score,
+                now_ts,
+                config.score_threshold,
+            )
+        )
+
+        if alert_ready:
             _print_alert(metric)
             write_alert_csv(
                 timestamp_iso=now_iso,
