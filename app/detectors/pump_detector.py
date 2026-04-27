@@ -472,13 +472,21 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         help="Print why each symbol was filtered out.",
     )
+    parser.add_argument(
+        "--watch",
+        action="store_true",
+        help="Repeat scanning continuously until interrupted.",
+    )
+    parser.add_argument(
+        "--interval-seconds",
+        type=int,
+        default=120,
+        help="Watch mode scan interval in seconds. (default: 120)",
+    )
     return parser.parse_args()
 
 
-def main() -> None:
-    args = _parse_args()
-    config = TEST_CONFIG if args.test_mode else REAL_CONFIG
-
+def _run_single_scan(args: argparse.Namespace, config: DetectorConfig) -> None:
     # alerts=0이어도 logs 디렉터리는 항상 생성.
     LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
 
@@ -541,6 +549,28 @@ def main() -> None:
     print(
         f"[INFO] scan complete | alerts={alerts} | filtered={{{filtered_text}}} | elapsed={elapsed:.1f}s"
     )
+
+
+def main() -> None:
+    args = _parse_args()
+    config = TEST_CONFIG if args.test_mode else REAL_CONFIG
+    interval_seconds = max(1, args.interval_seconds)
+
+    if not args.watch:
+        _run_single_scan(args, config)
+        return
+
+    print("[INFO] watch mode enabled")
+    scan_count = 0
+    try:
+        while True:
+            scan_count += 1
+            print(f"[INFO] watch scan #{scan_count} started")
+            _run_single_scan(args, config)
+            print(f"[INFO] next scan in {interval_seconds}s")
+            time.sleep(interval_seconds)
+    except KeyboardInterrupt:
+        print("[INFO] watch mode stopped by user (Ctrl+C)")
 
 
 if __name__ == "__main__":
