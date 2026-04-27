@@ -10,6 +10,7 @@ Run:
 
 from __future__ import annotations
 
+import argparse
 import csv
 import json
 import time
@@ -57,6 +58,32 @@ class PumpMetrics:
     volume_drop_risk: bool
     score: float
     reasons: List[str]
+
+
+@dataclass(frozen=True)
+class DetectorConfig:
+    mode: str
+    price_change_threshold: float
+    volume_ratio_threshold: float
+    score_threshold: float
+    swing_high_tolerance: float
+
+
+REAL_CONFIG = DetectorConfig(
+    mode="real",
+    price_change_threshold=0.03,
+    volume_ratio_threshold=2.0,
+    score_threshold=0.7,
+    swing_high_tolerance=0.003,
+)
+
+TEST_CONFIG = DetectorConfig(
+    mode="test",
+    price_change_threshold=0.015,
+    volume_ratio_threshold=1.3,
+    score_threshold=0.5,
+    swing_high_tolerance=0.007,
+)
 
 
 def _http_get(path: str, params: Optional[dict] = None) -> Optional[object]:
@@ -145,15 +172,17 @@ def calculate_volume_ratio(candles: Sequence[Candle], lookback: int = 20) -> flo
     return recent / avg
 
 
-def detect_swing_high_breakout(candles: Sequence[Candle], lookback: int = 20) -> bool:
+def detect_swing_high_breakout(
+    candles: Sequence[Candle], lookback: int = 20, tolerance: float = 0.003
+) -> bool:
     if len(candles) < lookback + 1:
         return False
     current = candles[-1].close
     prev_high = max(c.high for c in candles[-(lookback + 1) : -1])
     if prev_high <= 0:
         return False
-    # "근접" 허용: 직전 swing high 대비 0.3% 이내.
-    return current >= prev_high or (prev_high - current) / prev_high <= 0.003
+    # "근접" 허용: 직전 swing high 대비 tolerance 이내.
+    return current >= prev_high or (prev_high - current) / prev_high <= tolerance
 
 
 def detect_simple_fvg(candles: Sequence[Candle]) -> bool:
@@ -266,8 +295,8 @@ def calculate_pump_score(
     return min(1.0, max(0.0, score))
 
 
-def should_alert(symbol: str, price: float, score: float, now_ts: float) -> bool:
-    if score < 0.7:
+def should_alert(symbol: str, price: float, score: float, now_ts: float, score_threshold: float) -> bool:
+    if score < score_threshold:
         return False
 
     prev = LAST_ALERTS.get(symbol)
@@ -342,37 +371,48 @@ def _build_reasons(price_ok: bool, volume_ok: bool, swing_ok: bool, fvg_ok: bool
     return reasons
 
 
-def scan_symbol(symbol: str, btc_condition: str) -> Optional[PumpMetrics]:
+def scan_symbol(symbol: str, btc_condition: str, config: DetectorConfig) -> Tuple[Optional[PumpMetrics], Optional[str]]:
     candles_5m = fetch_klines(symbol, "5m", 40)
     candles_1m = fetch_klines(symbol, "1m", 12)
     if len(candles_5m) < 25 or len(candles_1m) < 7:
-        return None
+        return None, "insufficient_candles"
 
     price_change = calculate_price_change_5m(candles_5m)
     volume_ratio = calculate_volume_ratio(candles_5m, lookback=20)
-    swing_ok = detect_swing_high_breakout(candles_5m, lookback=20)
+    swing_ok = detect_swing_high_breakout(
+        candles_5m,
+        lookback=20,
+        tolerance=config.swing_high_tolerance,
+    )
     fvg_ok = detect_simple_fvg(candles_5m)
     rebound_ok = detect_simple_rebound(candles_5m)
 
-    price_ok = price_change >= 0.03
-    volume_ok = volume_ratio >= 2.0
+    price_ok = price_change >= config.price_change_threshold
+    volume_ok = volume_ratio >= config.volume_ratio_threshold
 
     chasing_risk = is_chasing_risk(candles_5m)
     volume_drop_risk = is_volume_drop_risk(candles_1m)
 
     # 무효화 조건.
     if btc_condition == "bearish_crash":
-        return None
+        return None, "btc_bearish_crash"
     if not volume_ok and price_ok:
-        return None
+        return None, "volume_below_threshold"
     if chasing_risk:
-        return None
+        return None, "chasing_risk"
     if volume_drop_risk:
-        return None
+        return None, "volume_drop_risk"
 
     # 필수 조건: 가격+거래량+swing
     if not (price_ok and volume_ok and swing_ok):
-        return None
+        failed: List[str] = []
+        if not price_ok:
+            failed.append("price")
+        if not volume_ok:
+            failed.append("volume")
+        if not swing_ok:
+            failed.append("swing")
+        return None, f"required_conditions_not_met({','.join(failed)})"
 
     score = calculate_pump_score(price_ok, volume_ok, swing_ok, fvg_ok, rebound_ok, btc_condition)
     reasons = _build_reasons(price_ok, volume_ok, swing_ok, fvg_ok, rebound_ok)
@@ -389,7 +429,7 @@ def scan_symbol(symbol: str, btc_condition: str) -> Optional[PumpMetrics]:
         volume_drop_risk=volume_drop_risk,
         score=score,
         reasons=reasons,
-    )
+    ), None
 
 
 def _print_alert(metric: PumpMetrics) -> None:
@@ -402,7 +442,28 @@ def _print_alert(metric: PumpMetrics) -> None:
     print(f"reason: {reason}")
 
 
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Pump entry candidate detector.")
+    parser.add_argument(
+        "--test-mode",
+        action="store_true",
+        help="Run detector in relaxed test mode thresholds.",
+    )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Print why each symbol was filtered out.",
+    )
+    return parser.parse_args()
+
+
 def main() -> None:
+    args = _parse_args()
+    config = TEST_CONFIG if args.test_mode else REAL_CONFIG
+
+    # alerts=0이어도 logs 디렉터리는 항상 생성.
+    LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+
     start = time.time()
     btc_condition = evaluate_btc_condition()
     if btc_condition == "bearish_crash":
@@ -414,7 +475,7 @@ def main() -> None:
         print("[WARN] 스캔 대상 심볼을 가져오지 못했습니다.")
         return
 
-    print(f"[INFO] scanning {len(symbols)} symbols | btc_condition={btc_condition}")
+    print(f"[INFO] scanning {len(symbols)} symbols | mode={config.mode} | btc_condition={btc_condition}")
 
     alerts = 0
     now_ts = time.time()
@@ -424,15 +485,24 @@ def main() -> None:
         if symbol == "BTCUSDT":
             continue
         try:
-            metric = scan_symbol(symbol, btc_condition)
+            metric, reject_reason = scan_symbol(symbol, btc_condition, config)
         except Exception as exc:  # defensive: continue full scan
             print(f"[WARN] symbol scan failed: {symbol} ({exc})")
             continue
 
         if metric is None:
+            if args.debug:
+                reason = reject_reason or "filtered"
+                print(f"[DEBUG] {symbol} filtered: {reason}")
             continue
 
-        if should_alert(symbol, metric.current_price, metric.score, now_ts):
+        if should_alert(
+            symbol,
+            metric.current_price,
+            metric.score,
+            now_ts,
+            config.score_threshold,
+        ):
             _print_alert(metric)
             write_alert_csv(
                 timestamp_iso=now_iso,
