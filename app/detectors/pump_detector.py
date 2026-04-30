@@ -334,6 +334,7 @@ def write_alert_csv(
     score: float,
     btc_condition: str,
     alert_reason: str,
+    status: str = "PENDING",
 ) -> None:
     LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
     new_file = not LOG_PATH.exists()
@@ -351,6 +352,7 @@ def write_alert_csv(
                     "score",
                     "btc_condition",
                     "alert_reason",
+                    "status",
                 ]
             )
         writer.writerow(
@@ -363,6 +365,7 @@ def write_alert_csv(
                 f"{score:.6f}",
                 btc_condition,
                 alert_reason,
+                status,
             ]
         )
 
@@ -545,6 +548,7 @@ def _run_single_scan(args: argparse.Namespace, config: DetectorConfig) -> None:
                 score=metric.score,
                 btc_condition=metric.btc_condition,
                 alert_reason=" + ".join(metric.reasons),
+                status="PENDING",
             )
             alerts += 1
 
