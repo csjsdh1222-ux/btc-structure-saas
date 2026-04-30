@@ -328,6 +328,7 @@ def should_alert(symbol: str, price: float, score: float, now_ts: float, score_t
 def write_alert_csv(
     timestamp_iso: str,
     symbol: str,
+    entry_reference_price: float,
     price_change_5m: float,
     volume_ratio: float,
     score: float,
@@ -343,7 +344,10 @@ def write_alert_csv(
             writer.writerow(
                 [
                     "timestamp",
+                    "alert_id",
                     "symbol",
+                    "entry_reference_price",
+                    "status",
                     "price_change_5m",
                     "volume_ratio",
                     "score",
@@ -354,7 +358,10 @@ def write_alert_csv(
         writer.writerow(
             [
                 timestamp_iso,
+                f"{timestamp_iso}_{symbol}",
                 symbol,
+                f"{entry_reference_price:.8f}",
+                "PENDING",
                 f"{price_change_5m:.6f}",
                 f"{volume_ratio:.6f}",
                 f"{score:.6f}",
@@ -536,6 +543,7 @@ def _run_single_scan(args: argparse.Namespace, config: DetectorConfig) -> None:
             write_alert_csv(
                 timestamp_iso=now_iso,
                 symbol=metric.symbol,
+                entry_reference_price=metric.current_price,
                 price_change_5m=metric.price_change_5m,
                 volume_ratio=metric.volume_ratio_5m,
                 score=metric.score,
