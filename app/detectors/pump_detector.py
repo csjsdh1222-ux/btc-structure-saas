@@ -344,10 +344,8 @@ def write_alert_csv(
             writer.writerow(
                 [
                     "timestamp",
-                    "alert_id",
                     "symbol",
                     "entry_reference_price",
-                    "status",
                     "price_change_5m",
                     "volume_ratio",
                     "score",
@@ -358,10 +356,8 @@ def write_alert_csv(
         writer.writerow(
             [
                 timestamp_iso,
-                f"{timestamp_iso}_{symbol}",
                 symbol,
                 f"{entry_reference_price:.8f}",
-                "PENDING",
                 f"{price_change_5m:.6f}",
                 f"{volume_ratio:.6f}",
                 f"{score:.6f}",
